@@ -1,25 +1,18 @@
 # BHTP/1 — HTTP, in binary
 
-A small binary framing of HTTP-style GET requests over one TCP connection.
-This document is all a stranger needs to write an interoperable client or
-server. The key words MUST, MUST NOT, SHOULD and MAY mean what RFC 2119 says.
-All integers are **unsigned, big-endian** (network byte order).
+Binary framing for HTTP-style GET/HEAD over one TCP connection. MUST / SHOULD /
+MAY as in RFC 2119. All integers are unsigned big-endian.
 
 ## 1. Connection
 
-The client opens **one** TCP connection and sends every request on it. The
-server keeps the connection open after each response and serves requests in
-the order they arrive. Either side may end the connection by sending GOAWAY
-(§3) and closing; closing without GOAWAY is also legal. There is no
-preface or handshake: the first bytes on the wire are a frame.
+The client opens **one** TCP connection and sends every request on it; the
+server answers in order and **keeps the connection open**, after errors too.
+No handshake: the first bytes on the wire are a frame. Either side may send
+GOAWAY (§3) and close.
 
-## 2. The frame
-
-Everything on the wire is a frame: a fixed 8-byte header and a payload.
+## 2. The frame — 8-byte header, then payload
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-----------------------------------------------+---------------+
 |                 Length (24)                   |   Type (8)    |
 +---------------+-------------------------------+---------------+
@@ -28,110 +21,86 @@ Everything on the wire is a frame: a fixed 8-byte header and a payload.
 |                   Payload (Length bytes) ...                  |
 ```
 
-| Field | Bits | Meaning |
-|---|---|---|
-| Length | 24 | Payload size in bytes, not counting the 8-byte header. |
-| Type | 8 | Frame type (§3). |
-| Flags | 8 | Bit 0x01 = END_STREAM. Other bits MUST be sent as 0 and MUST be ignored. |
-| Stream ID | 24 | Which request/response this frame belongs to. 0 = the connection itself. |
+- **Length** — payload bytes, header not counted.
+- **Type** — §3.
+- **Flags** — 0x01 = END_STREAM (last frame of this message). Other bits: send 0, ignore.
+- **Stream ID** — the request this frame belongs to; 0 = the connection.
+  Clients number requests 1, 2, 3, …; responses reuse the request's ID.
 
-**Why these widths.** HTTP/2 uses 24/8/8/31 (plus 1 reserved bit) = 9 bytes.
-We keep its first three fields and shrink the stream ID to 24 bits so the
-header is exactly **8 bytes — one 64-bit word, one `recv(8)`**.
-*Length 24:* 16 bits would cap a frame at 64 KiB forever; 32 bits would spend
-a byte that is always zero. 24 bits gives a 16 MiB ceiling, while §2.1 keeps
-the *working* limit small. *Type 8 / Flags 8:* we use 3 types and 1 flag;
-the other 253 types and 7 bits are our room to grow. *Stream 24:* HTTP/2
-needs 31 bits because browsers keep one connection alive for days and IDs
-are never reused. Our connection carries one session; 16.7 million requests
-per connection is plenty, and a client that runs out opens a new session.
-Stream IDs exist at all so every response names the request it answers,
-errors can be reported on stream 0, and a version 2 can interleave
-responses without changing the header.
+**Why 24/8/8/24.** HTTP/2 uses 24/8/8/31 + 1 reserved bit = 9 bytes. We keep
+its first three fields and cut the stream ID to 24 bits, so the header is
+exactly **8 bytes — one 64-bit word, one `recv(8)`**. *Length 24:* 16 bits
+would cap frames at 64 KiB forever, 32 bits wastes a byte that is always 0.
+*Type 8 / Flags 8:* we use 3 types and 1 flag; the rest is room to grow.
+*Stream 24:* HTTP/2 needs 31 bits because browsers hold a connection for days
+and never reuse IDs; 16.7 million requests per session is plenty for us. We
+keep a stream ID at all so each response names its request, connection-level
+errors have stream 0, and v2 can interleave responses with the same header.
 
-### 2.1 Size limit
-
-A v1 sender MUST NOT send a payload longer than **16 384 bytes**. A receiver
-that gets a longer one MUST NOT buffer it: it reads and discards exactly
-Length bytes (the stream stays in sync) and treats the frame as malformed.
-
-### 2.2 Stream IDs
-
-The client numbers requests 1, 2, 3, … — non-zero and increasing. Every
-response frame carries the ID of the request it answers.
+**Size limit.** A v1 sender MUST NOT send a payload over **16 384 bytes**
+(bodies are split across DATA frames). A receiver that gets a bigger one reads
+and discards exactly Length bytes — staying in sync — and treats it as malformed.
 
 ## 3. Frame types
 
 | Type | Name | Stream | Payload |
 |---|---|---|---|
-| 0x01 | HEADERS | ≠ 0 | A header block (§4). Starts a request or a response. |
-| 0x02 | DATA | ≠ 0 | Raw body bytes. |
-| 0x03 | GOAWAY | 0 | Optional UTF-8 reason. Sender closes after it. |
-
-END_STREAM on a frame means "this is the last frame of this message".
+| 0x01 | HEADERS | ≠ 0 | Header block (§4); opens a request or response |
+| 0x02 | DATA | ≠ 0 | Body bytes |
+| 0x03 | GOAWAY | 0 | Optional UTF-8 reason; sender then closes |
 
 ### 3.1 Unknown frame types — MUST skip
 
-**A receiver that meets a frame type it does not know MUST read Length
-bytes of payload, discard them, and carry on as if the frame were never
-sent.** It MUST NOT reply, error or close. This is the one rule that lets a
-version 2 add frames (PING, PUSH, PRIORITY…) that a v1 peer survives.
+**A receiver that meets a frame type it does not know MUST read Length bytes,
+discard them, and carry on as if the frame never came** — no reply, no error,
+no close. This is what lets a version 2 add frames a v1 peer survives.
 
 ## 4. Header block
 
-A HEADERS payload is a sequence of fields, back to back, until the payload
-ends. There is no count — Length already says where it stops.
+A HEADERS payload is fields back to back until Length runs out:
 
 ```
-static name:   | index (1..10) | value len (16) | value bytes |
-literal name:  | 0x00 | name len (8) | name bytes | value len (16) | value bytes |
+static name:   | index 1..10 | value len (16) | value |
+literal name:  | 0x00 | name len (8) | name | value len (16) | value |
 ```
 
-The ten names we actually send get one byte each (HPACK's static table).
-Anything else is spelled out, length-prefixed (HPACK's string literal).
+The ten names we actually send cost one byte (HPACK's static table); any other
+name is length-prefixed (HPACK's string literal).
 
-| # | Name | # | Name |
-|---|---|---|---|
-| 1 | method | 6 | accept |
-| 2 | path | 7 | content-type |
-| 3 | status | 8 | content-length |
-| 4 | host | 9 | server |
-| 5 | user-agent | 10 | date |
+| # | Name | # | Name | # | Name | # | Name | # | Name |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | method | 3 | status | 5 | user-agent | 7 | content-type | 9 | server |
+| 2 | path | 4 | host | 6 | accept | 8 | content-length | 10 | date |
 
-Names are lowercase ASCII (`a-z 0-9 - _ .`), 1–255 bytes. Values are UTF-8,
-0–65 535 bytes. Index bytes 11–255 are reserved; in v1 they are malformed.
-Numbers in values (status, content-length) are ASCII decimal: `"200"`.
+Names: lowercase `a-z 0-9 - _ .`, 1–255 bytes. Values: UTF-8, 0–65 535 bytes.
+Numbers are ASCII decimal (`"200"`). Indexes 11–255 are reserved → malformed in v1.
 
 ## 5. Request and response
 
-**Request** = one HEADERS frame with END_STREAM set, containing exactly one
-`method` (`GET` or `HEAD`) and exactly one `path` (starts with `/`). The
-client SHOULD send `host`, `user-agent`, `accept`. A v1 request has no body.
+**Request:** one HEADERS frame with END_STREAM, exactly one `method` (`GET` or
+`HEAD`) and one `path` starting with `/`; SHOULD add `host`, `user-agent`,
+`accept`. No body in v1.
 
-**Response** = one HEADERS frame carrying `status` (MUST), and `content-type`,
-`content-length`, `server`, `date` (SHOULD), followed by zero or more DATA
-frames. The last frame of the response has END_STREAM. If there is no body
-(HEAD, empty file) END_STREAM is set on the HEADERS frame itself.
+**Response:** one HEADERS frame with `status` (MUST) and `content-type`,
+`content-length`, `server`, `date` (SHOULD), then DATA frames; the last frame
+has END_STREAM. No body (HEAD, empty file) → END_STREAM on the HEADERS frame.
 
-The server maps `path` to a file under its root. A path naming a directory
-serves `index.html` inside it. A path that resolves outside the root MUST
-NOT be served.
+The server maps `path` to a file under its root; a directory serves its
+`index.html`; anything resolving outside the root MUST NOT be served.
 
 | Status | When |
 |---|---|
-| 200 | File found. Body = file bytes. |
-| 400 | Malformed frame: bad header block, reserved index, missing/duplicate method or path, path not starting with `/`, HEADERS without END_STREAM, HEADERS on stream 0, DATA from a client, payload over 16 384 bytes. |
-| 404 | No such file (or outside the root). |
-| 405 | Method other than GET/HEAD. |
+| 200 | Found — body is the file |
+| 400 | Malformed: bad or reserved header encoding, missing/duplicate `method` or `path`, `path` without leading `/`, request without END_STREAM, HEADERS on stream 0, DATA from a client, payload over 16 384 |
+| 404 | Not found, or outside the root |
+| 405 | Method other than GET/HEAD |
 
-Error responses carry a short `text/plain` body. **A 400 is sent on the
-stream the bad frame named (stream 0 if it named 0) and the connection stays
-open** — the Length field always tells the server where the next frame
-starts. Only a connection that closes mid-frame is unrecoverable.
+Errors carry a short `text/plain` body. **A 400 goes on the stream the bad
+frame named (0 if it named 0) and the connection stays open** — Length always
+says where the next frame starts. Only a close mid-frame is unrecoverable.
 
-## 6. Leaving room for version 2
+## 6. Room for version 2
 
-New frame types are skipped by v1 peers (§3.1); new flag bits are ignored
-(§2); the static table can grow into indexes 11–255 once both sides agree;
-the 16 KiB working limit can be raised without touching the header.
-A complete annotated request and response is in [HEXDUMP.md](HEXDUMP.md).
+Unknown types are skipped (§3.1), unknown flag bits ignored (§2), the static
+table can grow into 11–255, and the 16 KiB limit can rise without changing
+the header. Every byte of a real exchange: [HEXDUMP.md](HEXDUMP.md).
