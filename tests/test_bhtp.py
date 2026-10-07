@@ -210,6 +210,53 @@ class BhtpTest(unittest.TestCase):
         r = self.bcurl("--probe", "localhost:%d/index.html" % self.port)
         self.assertEqual(r.returncode, 0)
 
+    def test_bcurl_against_hand_written_server(self):
+        """bcurl must follow the spec, not just bserve. A fake server built
+        from raw bytes sends an unknown frame, a literal header and a body
+        split over two DATA frames, then answers a second request with 404."""
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+        self.addCleanup(ls.close)
+        port = ls.getsockname()[1]
+        p = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "bcurl"), "localhost:%d/a" % port, "/b"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        c, _ = ls.accept()
+        c.settimeout(5)
+
+        def recv_n(n):
+            buf = b""
+            while len(buf) < n:
+                chunk = c.recv(n - len(buf))
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+            return buf
+
+        def read_raw():
+            hdr = recv_n(8)
+            return hdr, recv_n(int.from_bytes(hdr[0:3], "big"))
+
+        hdr, payload = read_raw()                       # request 1
+        self.assertEqual(hdr[3:], b"\x01\x01\x00\x00\x01")
+        self.assertIn(b"\x02\x00\x02/a", payload)       # path = /a
+        c.sendall(raw_frame(0x55, 0, 0, b"v2 stuff")    # unknown type: skip
+                  + raw_frame(0x01, 0, 1, b"\x03\x00\x03200"
+                              + b"\x00\x06x-test\x00\x01y")
+                  + raw_frame(0x02, 0, 1, b"hel")
+                  + raw_frame(0x02, 0x01, 1, b"lo"))
+
+        hdr, payload = read_raw()                       # request 2, same socket
+        self.assertEqual(hdr[3:], b"\x01\x01\x00\x00\x02")
+        self.assertIn(b"\x02\x00\x02/b", payload)
+        c.sendall(raw_frame(0x01, 0x01, 2, b"\x03\x00\x03404"))
+
+        out, err = p.communicate(timeout=5)
+        c.close()
+        self.assertEqual(out, b"hello")
+        self.assertEqual(p.returncode, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ a client (`bcurl`), and the spec that is the only thing they share.
 | [bserve](bserve) | Track 1 — the server |
 | [bcurl](bcurl) | Track 2 — the client |
 | [bhtp.py](bhtp.py) | Framing + header codec shared by both |
-| [tests/](tests/test_bhtp.py) | End-to-end tests over real sockets (21 tests) |
+| [tests/](tests/test_bhtp.py) | End-to-end tests over real sockets (22 tests) |
 | [www/](www) | Sample site to serve |
 
 Needs only Python 3.8+ (standard library, no installs).
@@ -62,7 +62,7 @@ The tests start a real `bserve` and talk to it with **hand-packed bytes
 written straight from SPEC.md** (not through `bhtp.py`), so they check the
 spec, not just that our client agrees with our server: 200/404/400/405,
 traversal, stream 0, oversized frames, unknown frame types, five requests on
-one connection, a 51 KB file split across DATA frames, and bcurl's exit codes.
+one connection, a 51 KB file split across DATA frames, bcurl's exit codes, and bcurl against a hand-written fake server (unknown frame, literal header, split body, two requests on one socket).
 
 ## Design in one paragraph
 
