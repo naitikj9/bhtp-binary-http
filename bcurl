@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""bcurl -- fetch over BHTP/1.
+
+    ./bcurl [-v] [-I] localhost:9000/index.html [/more /paths ...]
+
+Every URL is fetched over ONE connection, in order. The body goes to
+stdout, -v hexdumps every frame to stderr.
+
+Exit status: 0 all ok, 4 some 4xx, 5 some 5xx, 1 connection or protocol
+error, 2 usage error.
+"""
+
+import argparse
+import os
+import socket
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bhtp  # noqa: E402
+
+USER_AGENT = "bcurl/1.0"
+UNKNOWN_TYPE = 0x7F       # used by --probe to test the skip rule
+
+
+def parse_url(url):
+    """'bhtp://host:port/path' or 'host:port/path' -> (host, port, path)."""
+    if "://" in url:
+        scheme, url = url.split("://", 1)
+        if scheme != "bhtp":
+            raise ValueError("only bhtp:// URLs are supported")
+    hostport, slash, path = url.partition("/")
+    host, _, port = hostport.partition(":")
+    if not host:
+        raise ValueError("missing host in %r" % url)
+    return host, int(port or 9000), "/" + path
+
+
+class Client:
+    def __init__(self, host, port, verbose):
+        self.host = host
+        self.port = port
+        self.verbose = verbose
+        self.sock = socket.create_connection((host, port))
+        self.next_stream = 1
+
+    def send(self, ftype, flags, stream, payload=b""):
+        raw = bhtp.pack_frame(ftype, flags, stream, payload)
+        if self.verbose:
+            bhtp.dump(sys.stderr, ">", bhtp.as_frame(raw))
+        self.sock.sendall(raw)
+
+    def fetch(self, method, path, out):
+        """Send one request and stream the body to out. Returns the status."""
+        stream = self.next_stream
+        self.next_stream += 1
+        fields = [("method", method),
+                  ("path", path),
+                  ("host", "%s:%d" % (self.host, self.port)),
+                  ("user-agent", USER_AGENT),
+                  ("accept", "*/*")]
+        self.send(bhtp.HEADERS, bhtp.END_STREAM, stream, bhtp.encode_headers(fields))
+
+        status, headers, received = None, {}, 0
+        while True:
+            frame = bhtp.read_frame(self.sock)
+            if frame is None:
+                raise EOFError("server closed the connection mid-response")
+            if self.verbose:
+                bhtp.dump(sys.stderr, "<", frame)
+
+            if frame.type == bhtp.GOAWAY:
+                raise EOFError("server sent GOAWAY: %s"
+                               % frame.payload.decode("utf-8", "replace"))
+            if frame.type not in (bhtp.HEADERS, bhtp.DATA):
+                continue                      # SPEC 3.1: skip unknown types
+            if frame.oversized:
+                raise bhtp.ProtocolError("server sent an oversized frame")
+            if frame.stream != stream:
+                # e.g. a 400 the server sent on stream 0 -- report, keep going
+                sys.stderr.write("bcurl: ignoring frame for stream %d\n" % frame.stream)
+                continue
+
+            if frame.type == bhtp.HEADERS:
+                if status is not None:
+                    raise bhtp.ProtocolError("second HEADERS frame on stream %d" % stream)
+                headers = dict(bhtp.decode_headers(frame.payload))
+                if "status" not in headers:
+                    raise bhtp.ProtocolError("response has no status")
+                status = int(headers["status"])
+            else:
+                if status is None:
+                    raise bhtp.ProtocolError("DATA before HEADERS")
+                out.write(frame.payload)
+                received += len(frame.payload)
+
+            if frame.flags & bhtp.END_STREAM:
+                break
+
+        out.flush()
+        expected = headers.get("content-length")
+        if method != "HEAD" and expected is not None and int(expected) != received:
+            sys.stderr.write("bcurl: warning: content-length %s but got %d bytes\n"
+                             % (expected, received))
+        if self.verbose:
+            sys.stderr.write("* %s %s -> %d (%d bytes)\n" % (method, path, status, received))
+        return status
+
+    def close(self):
+        try:
+            self.send(bhtp.GOAWAY, 0, 0, b"done")
+        except OSError:
+            pass
+        self.sock.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fetch files over BHTP/1 on one connection.")
+    ap.add_argument("-v", "--verbose", action="store_true", help="hexdump every frame to stderr")
+    ap.add_argument("-I", "--head", action="store_true", help="send HEAD instead of GET")
+    ap.add_argument("--probe", action="store_true",
+                    help="send a frame of unknown type 0x%02x first (server must skip it)"
+                         % UNKNOWN_TYPE)
+    ap.add_argument("url", help="host:port/path")
+    ap.add_argument("more", nargs="*",
+                    help="more paths (/x) or URLs on the same host:port, same connection")
+    args = ap.parse_args()
+
+    try:
+        host, port, first = parse_url(args.url)
+        paths = [first]
+        for extra in args.more:
+            if extra.startswith("/"):
+                paths.append(extra)
+                continue
+            h, p, path = parse_url(extra)
+            if (h, p) != (host, port):
+                raise ValueError("%s needs a second connection; bcurl never opens one" % extra)
+            paths.append(path)
+    except ValueError as e:
+        sys.stderr.write("bcurl: %s\n" % e)
+        return 2
+
+    try:
+        client = Client(host, port, args.verbose)
+    except OSError as e:
+        sys.stderr.write("bcurl: cannot connect to %s:%d: %s\n" % (host, port, e))
+        return 1
+
+    worst = 0
+    try:
+        if args.probe:
+            client.send(UNKNOWN_TYPE, 0, 0, b"a frame from version 2")
+        out = sys.stdout.buffer
+        for path in paths:
+            status = client.fetch("HEAD" if args.head else "GET", path, out)
+            if status >= 400:
+                sys.stderr.write("bcurl: %s -> %d\n" % (path, status))
+                worst = max(worst, status // 100)
+    except (bhtp.ProtocolError, EOFError, OSError) as e:
+        sys.stderr.write("bcurl: %s\n" % e)
+        return 1
+    finally:
+        client.close()
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""bserve -- serve a directory over BHTP/1.
+
+    ./bserve ./www 9000 [-v]
+"""
+
+import argparse
+import email.utils
+import mimetypes
+import os
+import socket
+import sys
+import threading
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bhtp  # noqa: E402
+
+SERVER_NAME = "bserve/1.0"
+IDLE_TIMEOUT = 120
+
+
+class Connection:
+    def __init__(self, sock, addr, root, verbose):
+        self.sock = sock
+        self.peer = "%s:%d" % addr[:2]
+        self.root = root
+        self.verbose = verbose
+        self.rejected = set()      # streams already answered with an error
+
+    def log(self, msg):
+        sys.stderr.write("[%s] %s\n" % (self.peer, msg))
+        sys.stderr.flush()
+
+    def send(self, ftype, flags, stream, payload=b""):
+        raw = bhtp.pack_frame(ftype, flags, stream, payload)
+        if self.verbose:
+            bhtp.dump(sys.stderr, "<", bhtp.as_frame(raw))
+        self.sock.sendall(raw)
+
+    # ------------------------------------------------------------ replies
+
+    def respond(self, stream, status, body=b"", ctype="text/plain; charset=utf-8",
+                extra=(), head_only=False):
+        fields = [("status", str(status)),
+                  ("server", SERVER_NAME),
+                  ("date", email.utils.formatdate(usegmt=True)),
+                  ("content-type", ctype),
+                  ("content-length", str(len(body)))]
+        fields.extend(extra)
+        no_body = head_only or not body
+        self.send(bhtp.HEADERS, bhtp.END_STREAM if no_body else 0, stream,
+                  bhtp.encode_headers(fields))
+        if no_body:
+            return
+        for off in range(0, len(body), bhtp.MAX_FRAME):
+            chunk = body[off:off + bhtp.MAX_FRAME]
+            last = off + bhtp.MAX_FRAME >= len(body)
+            self.send(bhtp.DATA, bhtp.END_STREAM if last else 0, stream, chunk)
+
+    def error(self, stream, status, reason):
+        self.log("#%d -> %d %s" % (stream, status, reason))
+        self.rejected.add(stream)
+        self.respond(stream, status, ("%d %s\n" % (status, reason)).encode())
+
+    # ----------------------------------------------------------- requests
+
+    def resolve(self, path):
+        """Map a request path to a file under root, or None."""
+        path = urllib.parse.unquote(path.split("?", 1)[0])
+        if "\x00" in path:
+            return None
+        full = os.path.realpath(os.path.join(self.root, path.lstrip("/")))
+        if full != self.root and not full.startswith(self.root + os.sep):
+            return None                       # ../ escape attempt
+        if os.path.isdir(full):
+            full = os.path.join(full, "index.html")
+        return full if os.path.isfile(full) else None
+
+    def handle_request(self, frame):
+        stream = frame.stream
+        if stream == 0:
+            return self.error(0, 400, "HEADERS on stream 0")
+        try:
+            fields = bhtp.decode_headers(frame.payload)
+        except bhtp.ProtocolError as e:
+            return self.error(stream, 400, str(e))
+        if not frame.flags & bhtp.END_STREAM:
+            return self.error(stream, 400, "request HEADERS must set END_STREAM")
+
+        methods = [v for k, v in fields if k == "method"]
+        paths = [v for k, v in fields if k == "path"]
+        if len(methods) != 1 or len(paths) != 1:
+            return self.error(stream, 400, "need exactly one method and one path")
+        method, path = methods[0], paths[0]
+        if not path.startswith("/"):
+            return self.error(stream, 400, "path must start with /")
+        if method not in ("GET", "HEAD"):
+            return self.error(stream, 405, "method not allowed")
+
+        target = self.resolve(path)
+        if target is None:
+            return self.error(stream, 404, "not found: " + path)
+        with open(target, "rb") as f:
+            body = f.read()
+        ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+        if ctype.startswith("text/"):
+            ctype += "; charset=utf-8"
+        mtime = email.utils.formatdate(os.path.getmtime(target), usegmt=True)
+        self.log("#%d %s %s -> 200 (%d bytes)" % (stream, method, path, len(body)))
+        self.respond(stream, 200, body, ctype,
+                     extra=[("last-modified", mtime)], head_only=(method == "HEAD"))
+
+    # -------------------------------------------------------------- loop
+
+    def run(self):
+        self.log("connected")
+        try:
+            while True:
+                try:
+                    frame = bhtp.read_frame(self.sock)
+                except socket.timeout:
+                    self.send(bhtp.GOAWAY, 0, 0, b"idle timeout")
+                    break
+                if frame is None:
+                    break
+                if self.verbose:
+                    bhtp.dump(sys.stderr, ">", frame)
+
+                if frame.oversized:
+                    self.error(frame.stream, 400, "frame larger than %d bytes" % bhtp.MAX_FRAME)
+                elif frame.type == bhtp.HEADERS:
+                    self.handle_request(frame)
+                elif frame.type == bhtp.DATA:
+                    # v1 requests carry no body; stay quiet if we already
+                    # rejected this stream, otherwise it is malformed.
+                    if frame.stream not in self.rejected:
+                        self.error(frame.stream, 400, "unexpected DATA from client")
+                elif frame.type == bhtp.GOAWAY:
+                    self.log("client sent GOAWAY")
+                    break
+                else:
+                    # SPEC 3.1: an unknown frame type MUST be skipped. The
+                    # payload is already consumed; we just do nothing.
+                    self.log("skipped unknown frame type 0x%02x (%d bytes)"
+                             % (frame.type, len(frame.payload)))
+        except (EOFError, ConnectionError) as e:
+            self.log("connection dropped: %s" % e)
+        finally:
+            self.sock.close()
+            self.log("closed")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Serve a directory over BHTP/1.")
+    ap.add_argument("root", help="directory to serve")
+    ap.add_argument("port", type=int)
+    ap.add_argument("-v", "--verbose", action="store_true", help="hexdump every frame")
+    args = ap.parse_args()
+
+    root = os.path.realpath(args.root)
+    if not os.path.isdir(root):
+        sys.exit("bserve: %s is not a directory" % args.root)
+
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("", args.port))
+    lsock.listen(16)
+    sys.stderr.write("bserve: serving %s on port %d\n" % (root, args.port))
+    sys.stderr.flush()
+
+    try:
+        while True:
+            sock, addr = lsock.accept()
+            sock.settimeout(IDLE_TIMEOUT)
+            conn = Connection(sock, addr, root, args.verbose)
+            threading.Thread(target=conn.run, daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        lsock.close()
+
+
+if __name__ == "__main__":
+    main()
